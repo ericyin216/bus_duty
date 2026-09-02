@@ -1,0 +1,598 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { Bus, Pencil, Trash2, Check, X, Plus } from 'lucide-react';
+
+const ENTRIES_KEY = 'shift-log-entries';
+const SETTINGS_KEY = 'shift-log-settings';
+const HOURLY_RATE = 13.72;
+const DEFAULT_TAX_RATE = 20;
+
+function toMinutes(t) {
+  if (!t) return null;
+  const [h, m] = t.split(':').map(Number);
+  if (Number.isNaN(h) || Number.isNaN(m)) return null;
+  return h * 60 + m;
+}
+
+function shiftSpanMinutes(start, end) {
+  const s = toMinutes(start);
+  const e = toMinutes(end);
+  if (s === null || e === null) return 0;
+  let diff = e - s;
+  if (diff <= 0) diff += 24 * 60;
+  return diff;
+}
+
+function workedMinutes(start, end, breakMin) {
+  const span = shiftSpanMinutes(start, end);
+  if (!span) return 0;
+  return Math.max(span - (Number(breakMin) || 0), 0);
+}
+
+function calcPayBefore(workedMins) {
+  return (workedMins / 60) * HOURLY_RATE;
+}
+
+function calcPayAfter(payBefore, taxRatePercent) {
+  const rate = Number(taxRatePercent);
+  const safeRate = Number.isFinite(rate) ? rate : DEFAULT_TAX_RATE;
+  return payBefore * (1 - safeRate / 100);
+}
+
+function fmtHM(mins) {
+  const total = Math.round(mins || 0);
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  return `${h}h ${String(m).padStart(2, '0')}m`;
+}
+
+function fmtGBP(n) {
+  const num = Number(n) || 0;
+  return `£${num.toFixed(2)}`;
+}
+
+function fmtDateLabel(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  if (Number.isNaN(d.getTime())) return dateStr;
+  return d.toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: 'short' });
+}
+
+function todayStr() {
+  const d = new Date();
+  return d.toISOString().slice(0, 10);
+}
+
+const emptyForm = {
+  date: todayStr(),
+  duty: '',
+  fleet: '',
+  route: '',
+  start: '',
+  end: '',
+  breakMin: '',
+};
+
+export default function ShiftLog() {
+  const [entries, setEntries] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [form, setForm] = useState(emptyForm);
+  const [editingId, setEditingId] = useState(null);
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState(null);
+  const [statusMsg, setStatusMsg] = useState('');
+  const [view, setView] = useState('month');
+  const [taxRate, setTaxRate] = useState(DEFAULT_TAX_RATE);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(ENTRIES_KEY, false);
+        if (res && res.value) setEntries(JSON.parse(res.value));
+      } catch (e) {
+        // nothing saved yet
+      }
+      try {
+        const res = await window.storage.get(SETTINGS_KEY, false);
+        if (res && res.value) {
+          const parsed = JSON.parse(res.value);
+          if (parsed && Number.isFinite(parsed.taxRatePercent)) setTaxRate(parsed.taxRatePercent);
+        }
+      } catch (e) {
+        // default settings
+      } finally {
+        setLoaded(true);
+      }
+    })();
+  }, []);
+
+  async function persist(next) {
+    setEntries(next);
+    try {
+      const res = await window.storage.set(ENTRIES_KEY, JSON.stringify(next), false);
+      setStatusMsg(res ? '' : 'Could not save. Try again.');
+    } catch (e) {
+      setStatusMsg('Could not save. Try again.');
+    }
+  }
+
+  async function persistTaxRate(rate) {
+    setTaxRate(rate);
+    try {
+      await window.storage.set(SETTINGS_KEY, JSON.stringify({ taxRatePercent: rate }), false);
+    } catch (e) {
+      // best effort
+    }
+  }
+
+  function resetForm() {
+    setForm(emptyForm);
+    setEditingId(null);
+  }
+
+  const liveWorked = form.start && form.end ? workedMinutes(form.start, form.end, form.breakMin) : null;
+  const livePayBefore = liveWorked !== null ? calcPayBefore(liveWorked) : null;
+  const livePayAfter = livePayBefore !== null ? calcPayAfter(livePayBefore, taxRate) : null;
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (!form.date || !form.route || !form.start || !form.end) {
+      setStatusMsg('Date, route, start and end time are needed.');
+      return;
+    }
+    const worked = workedMinutes(form.start, form.end, form.breakMin);
+    const payBefore = calcPayBefore(worked);
+    const payAfter = calcPayAfter(payBefore, taxRate);
+    const record = { ...form, payBefore, payAfter };
+    if (editingId) {
+      persist(entries.map((en) => (en.id === editingId ? { ...record, id: editingId } : en)));
+    } else {
+      persist([...entries, { ...record, id: Date.now().toString() }]);
+    }
+    resetForm();
+  }
+
+  function handleEdit(entry) {
+    setForm({
+      date: entry.date,
+      duty: entry.duty || '',
+      fleet: entry.fleet || '',
+      route: entry.route,
+      start: entry.start,
+      end: entry.end,
+      breakMin: entry.breakMin,
+    });
+    setEditingId(entry.id);
+    setConfirmingDeleteId(null);
+  }
+
+  function handleDelete(id) {
+    persist(entries.filter((en) => en.id !== id));
+    setConfirmingDeleteId(null);
+    if (editingId === id) resetForm();
+  }
+
+  const sorted = useMemo(
+    () => [...entries].sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id)),
+    [entries]
+  );
+
+  const currentMonth = todayStr().slice(0, 7);
+  const filtered = useMemo(
+    () => (view === 'month' ? sorted.filter((en) => en.date.startsWith(currentMonth)) : sorted),
+    [sorted, view, currentMonth]
+  );
+
+  const totals = useMemo(() => {
+    return filtered.reduce(
+      (acc, en) => {
+        acc.worked += workedMinutes(en.start, en.end, en.breakMin);
+        acc.breakMin += Number(en.breakMin) || 0;
+        acc.before += Number(en.payBefore) || 0;
+        acc.after += Number(en.payAfter) || 0;
+        return acc;
+      },
+      { worked: 0, breakMin: 0, before: 0, after: 0 }
+    );
+  }, [filtered]);
+
+  return (
+    <div className="sl-root">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
+
+        .sl-root {
+          font-family: 'Inter', system-ui, sans-serif;
+          background: #EDE7D9;
+          color: #1C2B22;
+          min-height: 100%;
+          padding-bottom: 56px;
+        }
+        .sl-header {
+          background: #1F4D3A;
+          color: #EDE7D9;
+          padding: 26px 20px 40px;
+        }
+        .sl-header-inner {
+          max-width: 900px;
+          margin: 0 auto;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 14px;
+          flex-wrap: wrap;
+        }
+        .sl-title {
+          font-family: 'Oswald', sans-serif;
+          font-weight: 600;
+          font-size: 26px;
+          letter-spacing: 0.3px;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          margin: 0;
+        }
+        .sl-subtitle {
+          font-size: 13px;
+          color: #C9DBCF;
+          margin: 4px 0 0 34px;
+        }
+        .sl-badge {
+          font-family: 'IBM Plex Mono', monospace;
+          background: #E8A23D;
+          color: #1C2B22;
+          padding: 6px 14px;
+          font-weight: 600;
+          font-size: 13px;
+          font-variant-numeric: tabular-nums;
+        }
+
+        .sl-main {
+          max-width: 900px;
+          margin: 0 auto;
+          padding: 0 20px;
+        }
+
+        .sl-form {
+          background: #FBF9F4;
+          border: 1px solid #C9C0AA;
+          box-shadow: 0 6px 16px rgba(28,43,34,0.12);
+          margin-top: -24px;
+          padding: 20px 20px 18px;
+        }
+        .sl-form-title {
+          font-family: 'Oswald', sans-serif;
+          font-size: 16px;
+          font-weight: 600;
+          margin: 0 0 14px;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+        }
+        .sl-cancel-link {
+          font-family: 'Inter', sans-serif;
+          font-size: 13px;
+          color: #8A5A2E;
+          background: none;
+          border: none;
+          cursor: pointer;
+          padding: 0;
+          text-decoration: underline;
+        }
+        .sl-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+          gap: 14px;
+        }
+        .sl-field { display: flex; flex-direction: column; gap: 5px; }
+        .sl-field label { font-size: 12.5px; color: #52604F; }
+        .sl-field input {
+          font-family: 'Inter', sans-serif;
+          font-size: 14.5px;
+          padding: 8px 9px;
+          border: 1px solid #C9C0AA;
+          background: #fff;
+          color: #1C2B22;
+        }
+        .sl-field input:focus {
+          outline: 2px solid #1F4D3A;
+          outline-offset: 1px;
+        }
+        .sl-pay-preview {
+          grid-column: 1 / -1;
+          font-family: 'IBM Plex Mono', monospace;
+          font-size: 13px;
+          color: #1F4D3A;
+          font-variant-numeric: tabular-nums;
+          background: #F1ECDD;
+          border: 1px solid #DAD3BE;
+          padding: 8px 10px;
+        }
+        .sl-form-footer {
+          grid-column: 1 / -1;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          margin-top: 4px;
+        }
+        .sl-error { font-size: 12.5px; color: #B23A2E; }
+        .sl-submit {
+          font-family: 'Oswald', sans-serif;
+          background: #1F4D3A;
+          color: #EDE7D9;
+          border: none;
+          padding: 10px 18px;
+          font-size: 14px;
+          font-weight: 600;
+          letter-spacing: 0.3px;
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        }
+        .sl-submit:hover { background: #163A2B; }
+
+        .sl-settings {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 12.5px;
+          color: #52604F;
+          margin: 14px 2px 0;
+          flex-wrap: wrap;
+        }
+        .sl-settings input {
+          width: 56px;
+          font-family: 'IBM Plex Mono', monospace;
+          font-size: 13px;
+          padding: 4px 6px;
+          border: 1px solid #C9C0AA;
+          background: #fff;
+          color: #1C2B22;
+        }
+
+        .sl-ledger { margin-top: 26px; }
+        .sl-ledger-head {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          border-bottom: 2px solid #1C2B22;
+          padding-bottom: 8px;
+          margin-bottom: 4px;
+          flex-wrap: wrap;
+          gap: 10px;
+        }
+        .sl-ledger-title {
+          font-family: 'Oswald', sans-serif;
+          font-size: 17px;
+          font-weight: 600;
+          margin: 0;
+        }
+        .sl-tabs { font-size: 13px; display: flex; gap: 14px; }
+        .sl-tab {
+          background: none;
+          border: none;
+          cursor: pointer;
+          color: #52604F;
+          padding: 2px 0;
+          font-family: 'Inter', sans-serif;
+        }
+        .sl-tab.active {
+          color: #1C2B22;
+          border-bottom: 2px solid #E8A23D;
+          font-weight: 600;
+        }
+        .sl-empty {
+          padding: 28px 4px;
+          color: #52604F;
+          font-size: 14px;
+        }
+        .sl-table-wrap { overflow-x: auto; }
+        table.sl-table {
+          width: 100%;
+          border-collapse: collapse;
+          min-width: 820px;
+          font-size: 13.5px;
+        }
+        .sl-table thead th {
+          text-align: left;
+          font-weight: 500;
+          color: #52604F;
+          font-size: 12px;
+          padding: 8px 8px;
+          border-bottom: 1px solid #C9C0AA;
+        }
+        .sl-table td {
+          padding: 9px 8px;
+          border-bottom: 1px solid #DAD3BE;
+          vertical-align: middle;
+        }
+        .sl-table tbody tr:hover { background: rgba(31,77,58,0.05); }
+        .sl-num { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }
+        .sl-actions { display: flex; gap: 6px; opacity: 0; transition: opacity 0.12s ease; }
+        .sl-table tbody tr:hover .sl-actions,
+        .sl-actions.confirming { opacity: 1; }
+        .sl-icon-btn {
+          border: none;
+          background: none;
+          cursor: pointer;
+          padding: 4px;
+          color: #52604F;
+          display: flex;
+        }
+        .sl-icon-btn:hover { color: #1C2B22; }
+        .sl-icon-btn.danger:hover { color: #B23A2E; }
+        .sl-icon-btn.confirm:hover { color: #1F4D3A; }
+        .sl-totals td {
+          border-bottom: none;
+          border-top: 2px solid #1C2B22;
+          font-weight: 600;
+          padding-top: 10px;
+        }
+        .sl-status {
+          margin-top: 10px;
+          font-size: 12.5px;
+          color: #B23A2E;
+        }
+      `}</style>
+
+      <header className="sl-header">
+        <div className="sl-header-inner">
+          <div>
+            <p className="sl-title"><Bus size={24} /> Shift Log</p>
+            <p className="sl-subtitle">Routes, hours and pay, kept in one place</p>
+          </div>
+          <span className="sl-badge">{entries.length} shift{entries.length === 1 ? '' : 's'} logged</span>
+        </div>
+      </header>
+
+      <main className="sl-main">
+        <form className="sl-form" onSubmit={handleSubmit}>
+          <p className="sl-form-title">
+            {editingId ? 'Edit shift' : "Log today's shift"}
+            {editingId && (
+              <button type="button" className="sl-cancel-link" onClick={resetForm}>Cancel edit</button>
+            )}
+          </p>
+          <div className="sl-grid">
+            <div className="sl-field">
+              <label htmlFor="sl-date">Date</label>
+              <input id="sl-date" type="date" value={form.date}
+                onChange={(e) => setForm({ ...form, date: e.target.value })} />
+            </div>
+            <div className="sl-field">
+              <label htmlFor="sl-duty">Duty number</label>
+              <input id="sl-duty" type="text" placeholder="e.g. D12" value={form.duty}
+                onChange={(e) => setForm({ ...form, duty: e.target.value })} />
+            </div>
+            <div className="sl-field">
+              <label htmlFor="sl-fleet">Fleet number</label>
+              <input id="sl-fleet" type="text" placeholder="e.g. 4021" value={form.fleet}
+                onChange={(e) => setForm({ ...form, fleet: e.target.value })} />
+            </div>
+            <div className="sl-field">
+              <label htmlFor="sl-route">Bus / route</label>
+              <input id="sl-route" type="text" placeholder="e.g. Route 4" value={form.route}
+                onChange={(e) => setForm({ ...form, route: e.target.value })} />
+            </div>
+            <div className="sl-field">
+              <label htmlFor="sl-start">Start time</label>
+              <input id="sl-start" type="time" value={form.start}
+                onChange={(e) => setForm({ ...form, start: e.target.value })} />
+            </div>
+            <div className="sl-field">
+              <label htmlFor="sl-end">End time</label>
+              <input id="sl-end" type="time" value={form.end}
+                onChange={(e) => setForm({ ...form, end: e.target.value })} />
+            </div>
+            <div className="sl-field">
+              <label htmlFor="sl-break">Break (minutes)</label>
+              <input id="sl-break" type="number" min="0" step="1" placeholder="0" value={form.breakMin}
+                onChange={(e) => setForm({ ...form, breakMin: e.target.value })} />
+            </div>
+
+            {livePayBefore !== null && (
+              <p className="sl-pay-preview">
+                Worked: {fmtHM(liveWorked)} · Pay before tax: {fmtGBP(livePayBefore)} (at £{HOURLY_RATE.toFixed(2)}/hr) · Pay after tax: {fmtGBP(livePayAfter)} (at {taxRate}% deducted)
+              </p>
+            )}
+
+            <div className="sl-form-footer">
+              <span className="sl-error">{statusMsg}</span>
+              <button type="submit" className="sl-submit">
+                {editingId ? <Check size={16} /> : <Plus size={16} />}
+                {editingId ? 'Save changes' : 'Log shift'}
+              </button>
+            </div>
+          </div>
+        </form>
+
+        <div className="sl-settings">
+          <span>Hourly rate: £{HOURLY_RATE.toFixed(2)} before tax</span>
+          <span>·</span>
+          <label htmlFor="sl-taxrate">Tax deduction:</label>
+          <input id="sl-taxrate" type="number" min="0" max="100" step="0.1" value={taxRate}
+            onChange={(e) => persistTaxRate(e.target.value === '' ? 0 : Number(e.target.value))} />
+          <span>%</span>
+        </div>
+
+        <section className="sl-ledger">
+          <div className="sl-ledger-head">
+            <p className="sl-ledger-title">Log</p>
+            <div className="sl-tabs">
+              <button type="button" className={`sl-tab ${view === 'month' ? 'active' : ''}`} onClick={() => setView('month')}>This month</button>
+              <button type="button" className={`sl-tab ${view === 'all' ? 'active' : ''}`} onClick={() => setView('all')}>All time</button>
+            </div>
+          </div>
+
+          {!loaded ? (
+            <p className="sl-empty">Loading your log…</p>
+          ) : filtered.length === 0 ? (
+            <p className="sl-empty">
+              {view === 'month'
+                ? 'No shifts logged this month yet. Add one above to start.'
+                : 'No shifts logged yet. Add your first shift above.'}
+            </p>
+          ) : (
+            <div className="sl-table-wrap">
+              <table className="sl-table">
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Duty</th>
+                    <th>Fleet no.</th>
+                    <th>Route</th>
+                    <th>Shift</th>
+                    <th>Break</th>
+                    <th>Worked</th>
+                    <th>Before tax</th>
+                    <th>After tax</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map((en) => (
+                    <tr key={en.id}>
+                      <td>{fmtDateLabel(en.date)}</td>
+                      <td>{en.duty || '—'}</td>
+                      <td>{en.fleet || '—'}</td>
+                      <td>{en.route}</td>
+                      <td className="sl-num">{en.start}–{en.end}</td>
+                      <td className="sl-num">{en.breakMin || 0}m</td>
+                      <td className="sl-num">{fmtHM(workedMinutes(en.start, en.end, en.breakMin))}</td>
+                      <td className="sl-num">{fmtGBP(en.payBefore)}</td>
+                      <td className="sl-num">{fmtGBP(en.payAfter)}</td>
+                      <td>
+                        <div className={`sl-actions ${confirmingDeleteId === en.id ? 'confirming' : ''}`}>
+                          {confirmingDeleteId === en.id ? (
+                            <>
+                              <button className="sl-icon-btn confirm" title="Confirm delete" onClick={() => handleDelete(en.id)}><Check size={15} /></button>
+                              <button className="sl-icon-btn" title="Cancel" onClick={() => setConfirmingDeleteId(null)}><X size={15} /></button>
+                            </>
+                          ) : (
+                            <>
+                              <button className="sl-icon-btn" title="Edit" onClick={() => handleEdit(en)}><Pencil size={15} /></button>
+                              <button className="sl-icon-btn danger" title="Delete" onClick={() => setConfirmingDeleteId(en.id)}><Trash2 size={15} /></button>
+                            </>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr className="sl-totals">
+                    <td colSpan={5}>Total ({filtered.length} shift{filtered.length === 1 ? '' : 's'})</td>
+                    <td className="sl-num">{totals.breakMin}m</td>
+                    <td className="sl-num">{fmtHM(totals.worked)}</td>
+                    <td className="sl-num">{fmtGBP(totals.before)}</td>
+                    <td className="sl-num">{fmtGBP(totals.after)}</td>
+                    <td></td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          )}
+        </section>
+      </main>
+    </div>
+  );
+}
